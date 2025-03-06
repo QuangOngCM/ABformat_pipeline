@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 
 import sys
+import gzip
+
+# Helper function to open files in text mode, supporting both plain and gzipped files
+def smart_open(filename, mode="rt"):
+    if filename.endswith(".gz"):
+        return gzip.open(filename, mode)
+    else:
+        return open(filename, mode)
 
 # Usage:
 #   python split_vcf_step1.py input.vcf file1.vcf file2.vcf
