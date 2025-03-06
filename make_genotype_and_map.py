@@ -18,8 +18,12 @@ Outputs:
    - INDEX is the 1-based order of first appearance in final_merged.
 
 3) snp_info_file.txt
-   - Exactly the same content (rows) as snp_map.txt,
+   - Exactly the same rows as snp_map.txt,
    - but with a different header: "SNP\tChr\tPos\tChip1"
+
+Logic changes:
+- If SNP_ID has the form "chr:pos", we parse from that.
+- Otherwise, we retrieve CHR, POS from the columns in final_merged.txt.
 """
 
 # Convert "AA","AB","BB","NA" => numeric code
@@ -30,19 +34,20 @@ GENO_CODE = {
     "NA": 5  # missing/invalid
 }
 
-def parse_chrom_pos(snp_id):
+def parse_snp_info(snp_id, chr_col, pos_col):
     """
-    Attempt to parse CHROM and POS from snp_id if in form "chr:pos".
-    If not parseable, return (snp_id, "0").
+    If snp_id has a colon, parse from snp_id -> (chrom, pos).
+    Otherwise, use the columns 'chr_col', 'pos_col'.
     """
     if ':' in snp_id:
-        parts = snp_id.split(':')
+        # e.g. "chr1:12345"
+        parts = snp_id.split(':', 1)
         chrom = parts[0]
         pos = parts[1]
         return (chrom, pos)
     else:
-        # If it's some other ID (e.g. "rs123"), fallback
-        return (snp_id, "0")
+        # fallback: use the CHR, POS from the file
+        return (chr_col, pos_col)
 
 def main():
     if len(sys.argv) < 5:
@@ -63,17 +68,22 @@ def main():
     # sample_genotypes[sampleID] = dict of snp_index -> numeric code
     sample_genotypes = {}
 
+    # We'll also store snp_meta[snp_id] = (chrom, pos) for each SNP
+    snp_meta = {}
+
     # 1) Read final_merged.txt
     with open(merged_file, 'r') as fin:
         header = fin.readline().rstrip('\n').split('\t')
 
-        # We need columns: SNP_ID, Sample_ID, GenotypeAB
+        # We need columns: SNP_ID, CHR, POS, Sample_ID, GenotypeAB
         try:
-            snp_id_idx = header.index("SNP_ID")
-            sample_id_idx = header.index("Sample_ID")
-            genotypeAB_idx = header.index("GenotypeAB")
+            idx_snp = header.index("SNP_ID")
+            idx_chr = header.index("CHR")
+            idx_pos = header.index("POS")
+            idx_sample = header.index("Sample_ID")
+            idx_genoAB = header.index("GenotypeAB")
         except ValueError:
-            print("ERROR: final_merged.txt must have columns SNP_ID, Sample_ID, GenotypeAB", file=sys.stderr)
+            print("ERROR: final_merged.txt must have columns: SNP_ID, CHR, POS, Sample_ID, GenotypeAB", file=sys.stderr)
             sys.exit(1)
 
         for line in fin:
@@ -81,15 +91,24 @@ def main():
             if not line:
                 continue
             cols = line.split('\t')
-            snp_id = cols[snp_id_idx]
-            sample_id = cols[sample_id_idx]
-            genoAB = cols[genotypeAB_idx]  # e.g. "AA","AB","BB","NA"
+            if len(cols) < 5:
+                continue
 
-            # Assign index if new SNP
+            snp_id = cols[idx_snp]
+            chr_val = cols[idx_chr]
+            pos_val = cols[idx_pos]
+            sample_id = cols[idx_sample]
+            genoAB = cols[idx_genoAB]  # e.g. "AA","AB","BB","NA"
+
+            # If new SNP, assign index
             if snp_id not in snp_index_dict:
                 snp_index = len(snp_index_list)
                 snp_index_list.append(snp_id)
                 snp_index_dict[snp_id] = snp_index
+
+                # Determine final chrom, pos from either snp_id or columns
+                chrom_parsed, pos_parsed = parse_snp_info(snp_id, chr_val, pos_val)
+                snp_meta[snp_id] = (chrom_parsed, pos_parsed)
             else:
                 snp_index = snp_index_dict[snp_id]
 
@@ -105,16 +124,16 @@ def main():
     with open(snp_map_file, 'w') as fout_map:
         fout_map.write("SNP_ID\tCHROM\tPOS\tINDEX\n")
         for i, snp_id in enumerate(snp_index_list):
-            chrom, pos = parse_chrom_pos(snp_id)
             index_1based = i + 1
+            chrom, pos = snp_meta[snp_id]
             fout_map.write(f"{snp_id}\t{chrom}\t{pos}\t{index_1based}\n")
 
     # 3) Write snp_info_file.txt (same rows, different header)
     with open(snp_info_file, 'w') as fout_info:
         fout_info.write("SNP\tChr\tPos\tChip1\n")
         for i, snp_id in enumerate(snp_index_list):
-            chrom, pos = parse_chrom_pos(snp_id)
             index_1based = i + 1
+            chrom, pos = snp_meta[snp_id]
             fout_info.write(f"{snp_id}\t{chrom}\t{pos}\t{index_1based}\n")
 
     # 4) Write genotype_file.txt
