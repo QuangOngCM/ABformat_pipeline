@@ -29,7 +29,7 @@ python nonambigous_convert.py file1.vcf file1_table.txt
 
 # 4) Convert ambiguous SNPs (file2.vcf) => file2_table.txt (requires reference FASTA)
 echo "==> Converting ambiguous SNPs (file2.vcf) to file2_table.txt..."
-python ambiguous_convert.py file2.vcf "$REFERENCE" file2_table.txt
+python ambigous_convert.py file2.vcf "$REFERENCE" file2_table.txt
 
 # 5) Merge file1_table.txt + file2_table.txt => final_merged.txt
 echo "==> Merging file1_table.txt and file2_table.txt into final_merged.txt..."
