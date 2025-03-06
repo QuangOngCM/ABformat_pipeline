@@ -1,156 +1,146 @@
 #!/usr/bin/env python3
 
 import sys
+import pysam
 
 """
-Step 2 script for File 1 (A↔C/G or T↔C/G).
-Now creates a table with columns:
-  SNP_ID, Sample_ID, VCF_REF, VCF_ALT, AlleleA, AlleleB, GenotypeAB, Allele1_AB, Allele2_AB, Strand
+Step 2 for File 2 (A/T or C/G) with additional columns from the input VCF:
+Output columns:
+  SNP_ID, CHR, POS, Sample_ID, VCF_REF, VCF_ALT, AlleleA, AlleleB, GenotypeAB,
+  Allele1_AB, Allele2_AB, Strand, SurroundingSequence, SourceGT
 
-Usage:
-  python step2_file1.py file1.vcf file1_table.txt
+Process:
+1. For each SNP in file2.vcf (A/T or C/G only),
+2. Fetch flanking bases from reference.fasta,
+3. Determine strand by scanning outward for the first A/T in the 5' or 3' direction,
+4. Assign Allele A/B accordingly,
+5. Convert each sample's genotype to A/B format (returning also the unphased order),
+6. Output table with the bracketed surrounding sequence, along with CHR and POS from the VCF.
 """
 
-def classify_alleles(ref, alt):
-    """
-    Determine AlleleA, AlleleB, and strand for a known A↔C/G or T↔C/G site.
+def find_strand_for_at_snp(chrom, pos, ref_fasta):
+    max_dist = 50
+    seq_len = ref_fasta.get_reference_length(chrom)
+    for dist in range(1, max_dist + 1):
+        up_coord = pos - dist
+        down_coord = pos + dist
+        if up_coord > 0:
+            upstream_base = ref_fasta.fetch(chrom, up_coord - 1, up_coord).upper()
+            if upstream_base in ['A', 'T']:
+                return "TOP"
+        if down_coord <= seq_len:
+            downstream_base = ref_fasta.fetch(chrom, down_coord - 1, down_coord).upper()
+            if downstream_base in ['A', 'T']:
+                return "BOT"
+    return None
 
-    Illumina rules:
-      - If {A, C/G}, it's TOP => A=AlleleA, C/G=AlleleB
-      - If {T, C/G}, it's BOT => T=AlleleA, C/G=AlleleB
-    """
-    r = ref.upper()
-    a = alt.upper()
-    pair = {r, a}
+def find_strand_for_cg_snp(chrom, pos, ref_fasta):
+    return find_strand_for_at_snp(chrom, pos, ref_fasta)
 
-    # A↔C/G => TOP
-    # T↔C/G => BOT
-    if pair.issubset({'A', 'C', 'G'}):
-        # Must be A with C or G => TOP
-        strand = "TOP"
-        # Allele A = 'A', Allele B = 'C' or 'G'
-        if r == 'A':
-            alleleA = 'A'
-            alleleB = a
-        elif a == 'A':
-            alleleA = 'A'
-            alleleB = r
-        else:
-            return None, None, None
+def assign_alleles_for_ambiguous(ref_base, alt_base, strand):
+    ref_base = ref_base.upper()
+    alt_base = alt_base.upper()
+    baseset = {ref_base, alt_base}
+    if baseset == {'A', 'T'}:
+        return ('A','T') if strand == "TOP" else ('T','A')
+    elif baseset == {'C', 'G'}:
+        return ('C','G') if strand == "TOP" else ('G','C')
     else:
-        # T↔C/G => BOT
-        strand = "BOT"
-        # Allele A = 'T', Allele B = 'C' or 'G'
-        if r == 'T':
-            alleleA = 'T'
-            alleleB = a
-        elif a == 'T':
-            alleleA = 'T'
-            alleleB = r
-        else:
-            return None, None, None
+        return (None, None)
 
-    return alleleA, alleleB, strand
-
-def convert_genotype_to_AB(genotype, ref_base, alt_base, alleleA, alleleB):
-    """
-    Convert the diploid genotype (e.g. "0|1", "0/1", "1|1") into A/B notation:
-      - If index=0 => REF
-      - If index=1 => ALT
-    Then check whether REF==AlleleA or AlleleB, likewise for ALT.
-
-    Returns:
-      (GenotypeAB, Allele1_AB, Allele2_AB)
-
-    Where GenotypeAB is sorted ("AA","AB","BB"), and Allele1_AB, Allele2_AB
-    reflect the unphased order in the original call.
-    """
-    # Missing or invalid genotype
-    if '.' in genotype:
+def convert_genotype_to_AB(gt_str, ref_base, alt_base, alleleA, alleleB):
+    if '.' in gt_str:
         return "NA", "NA", "NA"
-
-    # Normalize phased/unphased calls
-    alleles = genotype.replace('|','/').split('/')
-    if len(alleles) != 2:
+    parts = gt_str.replace('|','/').split('/')
+    if len(parts) != 2:
         return "NA", "NA", "NA"
-
     ab_list = []
-    for x in alleles:
+    for x in parts:
         if x == '0':
-            # REF => could be AlleleA or AlleleB
-            ab_list.append("A" if ref_base == alleleA else "B")
+            ab_list.append('A' if ref_base.upper() == alleleA else 'B')
         elif x == '1':
-            # ALT => could be AlleleA or AlleleB
-            ab_list.append("A" if alt_base == alleleA else "B")
+            ab_list.append('A' if alt_base.upper() == alleleA else 'B')
         else:
             return "NA", "NA", "NA"
-
-    # GenotypeAB => sorted, e.g. "AB" for heterozygote
     genotypeAB = "".join(sorted(ab_list))
-    allele1_AB, allele2_AB = ab_list[0], ab_list[1]
-
+    allele1_AB = ab_list[0]
+    allele2_AB = ab_list[1]
     return genotypeAB, allele1_AB, allele2_AB
 
+def highlight_snp_in_context(context_seq, snp_relpos, allele_set):
+    if len(allele_set) == 2:
+        label = "/".join(sorted(allele_set))
+    else:
+        label = "/".join(allele_set)
+    return context_seq[:snp_relpos] + "[" + label + "]" + context_seq[snp_relpos+1:]
+
 def main():
-    if len(sys.argv) < 3:
-        print("Usage: python nonambigous_convert.py file1.vcf file1_table.txt", file=sys.stderr)
+    if len(sys.argv) < 4:
+        print("Usage: python ambiguous_convert.py file2.vcf reference.fasta file2_table.txt", file=sys.stderr)
         sys.exit(1)
-
-    input_vcf = sys.argv[1]
-    output_txt = sys.argv[2]
-
-    with open(input_vcf, 'r') as fin, open(output_txt, 'w') as fout:
-        # Write header
-        fout.write("SNP_ID\tSample_ID\tVCF_REF\tVCF_ALT\tAlleleA\tAlleleB\tGenotypeAB\tAllele1_AB\tAllele2_AB\tStrand\tSourceGT\n")
-
+    vcf_file = sys.argv[1]
+    ref_fasta_path = sys.argv[2]
+    output_file = sys.argv[3]
+    ref_fasta = pysam.FastaFile(ref_fasta_path)
+    
+    with open(vcf_file, 'r') as fin, open(output_file, 'w') as fout:
+        # New header with additional CHR and POS columns
+        fout.write("SNP_ID\tCHR\tPOS\tSample_ID\tVCF_REF\tVCF_ALT\tAlleleA\tAlleleB\tGenotypeAB\tAllele1_AB\tAllele2_AB\tStrand\tSurroundingSequence\tSourceGT\n")
         sample_names = []
         for line in fin:
             line = line.strip()
             if line.startswith("##"):
-                # Skip metadata lines
                 continue
             if line.startswith("#CHROM"):
-                # Parse sample names from header
-                cols = line.split("\t")
-                sample_names = cols[9:]
+                header_cols = line.split("\t")
+                # Sample names start at column 9.
+                sample_names = header_cols[9:]
                 continue
-
             cols = line.split("\t")
             if len(cols) < 10:
-                # Invalid line
                 continue
-
-            chrom, pos, vid, ref, alt = cols[0], cols[1], cols[2], cols[3], cols[4]
-            # Next columns might be QUAL, FILTER, INFO, FORMAT, then genotypes
-            format_field = cols[8]
+            # Retrieve CHR and POS from the VCF columns.
+            chrom = cols[0]
+            pos_str = cols[1]
+            pos = int(pos_str)
+            vid = cols[2]
+            ref_base = cols[3]
+            alt_base = cols[4]
             sample_fields = cols[9:]
-
-            # Build SNP ID
-            snp_id = vid if vid != "." else f"{chrom}:{pos}"
-
-            # Classify Allele A/B and Strand
-            alleleA, alleleB, strand = classify_alleles(ref, alt)
-            if alleleA is None:
-                # Not a valid A↔C/G or T↔C/G site
+            
+            # Define SNP_ID: if vid is not ".", use it; otherwise, use "chrom:pos"
+            snp_id = vid if vid != "." else f"{chrom}:{pos_str}"
+            
+            # Determine strand using flanking sequences.
+            base_set = {ref_base.upper(), alt_base.upper()}
+            if base_set == {'A', 'T'}:
+                strand = find_strand_for_at_snp(chrom, pos, ref_fasta)
+            elif base_set == {'C', 'G'}:
+                strand = find_strand_for_cg_snp(chrom, pos, ref_fasta)
+            else:
                 continue
-
-            # Convert each sample genotype
+            if strand is None:
+                continue
+            alleleA, alleleB = assign_alleles_for_ambiguous(ref_base, alt_base, strand)
+            if alleleA is None:
+                continue
+            
+            # Get surrounding context (±10 bp)
+            flank_size = 10
+            chrom_len = ref_fasta.get_reference_length(chrom)
+            fetch_start = max(0, pos - 1 - flank_size)
+            fetch_end = min(chrom_len, pos - 1 + flank_size + 1)
+            context_seq = ref_fasta.fetch(chrom, fetch_start, fetch_end).upper()
+            snp_relpos = (pos - 1) - fetch_start
+            bracketed_seq = highlight_snp_in_context(context_seq, snp_relpos, base_set)
+            
             for i, sample_data in enumerate(sample_fields):
                 sample_id = sample_names[i]
-                # Typically "GT:DP:..." => first subfield is GT
-                source_gt = sample_data.split(":")[0] if ":" in sample_data else sample_data
+                subfields = sample_data.split(":")
+                source_gt = subfields[0]
+                genotypeAB, allele1_AB, allele2_AB = convert_genotype_to_AB(source_gt, ref_base, alt_base, alleleA, alleleB)
+                fout.write(f"{snp_id}\t{chrom}\t{pos_str}\t{sample_id}\t{ref_base}\t{alt_base}\t{alleleA}\t{alleleB}\t{genotypeAB}\t{allele1_AB}\t{allele2_AB}\t{strand}\t{bracketed_seq}\t{source_gt}\n")
+    ref_fasta.close()
 
-                genotypeAB, allele1_AB, allele2_AB = convert_genotype_to_AB(
-                    source_gt, ref.upper(), alt.upper(), alleleA, alleleB
-                )
-
-                # Write row
-                fout.write(
-                   f"{snp_id}\t{sample_id}\t{ref}\t{alt}\t"
-                   f"{alleleA}\t{alleleB}\t{genotypeAB}\t"
-                   f"{allele1_AB}\t{allele2_AB}\t{strand}\t"
-                   f"{source_gt}\n"
-                   )
-                   
 if __name__ == "__main__":
     main()
