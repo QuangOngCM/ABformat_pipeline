@@ -1,0 +1,154 @@
+### In case you need to change the sample IDs in the illumina final report.
+#!/usr/bin/env bash
+
+awk '
+  # 1) First pass: read sampleID_change.txt into an associative array "map"
+  FNR == NR {
+    map[$1] = $2
+    next
+  }
+
+  # 2) If we see "[Data]", set a flag so we know we are in the data section
+  /^\[Data\]/ {
+    inData = 1
+    print
+    next
+  }
+
+  # 3) Before the data section, just print the lines as-is (the header block)
+  !inData {
+    print
+    next
+  }
+
+  # 4) In the data section, replace the 2nd column if it matches an old ID in "map"
+  {
+    # Split the line by tabs so we can manipulate columns
+    # (In AWK, $1 = first column, $2 = second column, etc.)
+    if ($2 in map) {
+      $2 = map[$2]
+    }
+    print
+  }
+' sampleID_change.txt illumina_final_report.txt \
+  > final_report_renamed.txt
+ 
+ --------------------------------------------------------------------------------------
+ ### Extract the columns needed for further merging between the Illumina data and VCF file data
+ awk '
+BEGIN { OFS="\t" }
+
+# Skip lines that start with [ (e.g., [Header], [Data], etc.) or have fewer than 8 fields
+/^\[/ || NF < 8 { next }
+
+# If the line starts with "SNP Name", it’s the header → print a custom header and move on
+/^SNP Name/ {
+  print "SNP_ID","Sample_ID","GenotypeAB","Allele1_AB","Allele2_AB"
+  next
+}
+
+{
+  # Extract columns 1, 2, 7, and 8
+  snp_id     = $1
+  sample_id  = $2
+  allele1_AB = $7
+  allele2_AB = $8
+
+  # Create new “GenotypeAB” by concatenating allele1_AB + allele2_AB
+  genotypeAB = allele1_AB allele2_AB
+
+  # Print in the desired order
+  print snp_id, sample_id, genotypeAB, allele1_AB, allele2_AB
+}
+' final_renamed.txt > final_AB_table.txt
+
+----------------------------------------------
+##In this scenerio you have the final_merged.txt as the output when running the VCF2ABformat.sh
+##Following steps are used to merge the final_AB_table.txt and the final_merged.txt
+
+# 1a) Remove the header (skip the first line) and extract column 1 (SNP_ID)
+# 1b) Sort uniquely
+tail -n +2 final_merged.txt | cut -f1 | sort -u > merged_snps.txt
+
+# Similarly extract unique SNPs from final_AB_table.txt
+tail -n +2 final_AB_table.txt | cut -f1 | sort -u > ab_snps.txt
+
+# Check how many SNPs are in common
+comm -12 merged_snps.txt ab_snps.txt > overlap_snps.txt
+
+wc -l merged_snps.txt ab_snps.txt overlap_snps.txt
+
+# Save the header separately
+head -n1 final_AB_table.txt > final_AB_table_filtered.txt
+
+# For the data lines, skip the header, then keep rows whose first field is in overlap_snps.txt
+tail -n +2 final_AB_table.txt \
+| awk 'FNR==NR {a[$1]; next} ($1 in a)' overlap_snps.txt - \
+>> final_AB_table_filtered.txt
+
+# Print the canonical header first
+echo -e "SNP_ID\tSample_ID\tGenotypeAB\tAllele1_AB\tAllele2_AB" > final_merged_reformatted.txt
+
+# Skip the original header from final_merged.txt, reorder columns for data lines
+tail -n +2 ./12spData/final_merged.txt \
+| awk '{
+  # Adjust these indices to match your actual file:
+  snp       = $1
+  sample_id = $2
+  geno      = $7
+  a1        = $8
+  a2        = $9
+  print snp "\t" sample_id "\t" geno "\t" a1 "\t" a2
+}' >> final_merged_reformatted.txt
+
+# The final_AB_table_filtered.txt already has a header
+head -n1 final_AB_table_filtered.txt > unified_table.txt
+
+# Skip header from final_merged_reformatted.txt
+tail -n +2 final_merged_reformatted.txt >> unified_table.txt
+
+# Also skip the header from final_AB_table_filtered.txt
+tail -n +2 final_AB_table_filtered.txt >> unified_table.txt
+
+( 
+  # Print the header (first line) unchanged
+  head -n1 unified_table.txt
+  # Then sort the remaining lines by Sample_ID (col 2), then SNP_ID (col 1)
+  tail -n +2 unified_table.txt | sort -k2,2 -k1,1
+) > unified_table_sorted.txt
+
+##This python script takes unified_table_sorted.txt snp_info_file.txt (from the VCF2ABformat outputs) to make the genotype type files for the merged data set
+python make_genotype_files.py unified_table_sorted.txt snp_info_file.txt unified_genotype_file.txt unified_genotype_file_fimpute.txt
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
